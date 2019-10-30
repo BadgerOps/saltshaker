@@ -79,7 +79,7 @@ Deploying this salt configuration requires you to:
   3. check out the saltshaker repository
      ```
      cd /opt
-     git clone https://bitbucket.org/jdelic/saltshaker
+     git clone https://github.com/jdelic/saltshaker
      ln -sv /opt/saltshaker/srv/salt /srv/salt
      ln -sv /opt/saltshaker/srv/pillar /srv/pillar
      ln -sv /opt/saltshaker/srv/reactor /srv/reactor
@@ -235,21 +235,32 @@ are therefor only rendered to assigned minions from the master.
 
 ```yaml
 # Example configuration
-ext_pillar:
+    # Extension modules
+    extension_modules: /srv/salt-modules
+
+    ext_pillar:
     - dynamicsecrets:
-        - '*':  # render the following secrets to all minions
-            - consul-encryptionkey:
+        config:
+            approle-auth-token:
+                type: uuid
+            concourse-encryption:
+                length: 32
+            concourse-hostkey:
+                length: 2048
+                type: rsa
+            consul-acl-token:
+                type: uuid
+                unique-per-host: True
+            consul-encryptionkey:
                 encode: base64
                 length: 16
-                type: password  # this is the default for all values
-            - consul-initialacl:
-                type: uuid  # returns a UUID4 built from a secure random source
-        - database:  # render to minions with the database role
-            - postgres
-        - dev:  # render to minions with the dev role
-            - concourse-signingkey:
-                length: 2048
-                type: rsa  # generate a private key
+        grainmapping:
+            roles:
+                authserver:
+                    - approle-auth-token
+        hostmapping:
+            '*':
+                - consul-acl-token
 ```
 
 For `type: password` the Pillar will simply contain the random password string.
@@ -260,6 +271,9 @@ properties:
  * `public_pem` the public key in PEM encoding
  * `public` the public key in `ssh-rsa` format
  * `key` the private key in PEM encoding
+
+The dynamicsecrets pillar has been extracted [into it's own project at 
+jdelic/dynamicsecrets/](https://github.com/jdelic/dynamicsecrets).
 
 
 # Deploying applications
@@ -421,6 +435,19 @@ down the whole Consul cluster and thereby also erase all of the data.
 
 # Networking
 
+## sysctl config
+SysCTL is set up to accept
+
+ * `net.ipv4.ip_forward` IPv4 forwarding so we can route packets to docker and
+   other isolated separate networks
+ * `net.ipv4.ip_nonlocal_bind` to allow local services to bind to IPs and ports
+   even if those don't exist yet. This reduces usage of the `0.0.0.0` wildcard
+   allowing to write more secure configurations.
+ * `net.ipv4.conf.all.route_localnet` allows packets to and from `localhost` to
+   pass through iptables, making it possible to route them. This is required so
+   we can make consul services available on `localhost` even though consul runs 
+   on its own `consul0` dummy interface.
+
 ## iptables states
 iptables is configured by the `basics` and `iptables` states to use the
 `connstate`/`conntrack` module to allow incoming and outgoing packets in the
@@ -478,6 +505,12 @@ network assignments are this:
     interface". It's connected to a non-routed local network between the nodes.
   * The next numbered full network interface is commonly the "external
     interface". It's connected to the internet.
+  * The `consul0` interface is a dummy interface with a link-local IP of
+    `169.254.1.1`. It's used to provide consul HTTP API and DNS API access to
+    local services. A link-local address is used so it can be routed from
+    the docker bridge.
+  * `docker0` is the default bridge network set up by Docker that containers
+    usually attach to.
 
 Some configurations (like the mailserver states) can expect multiple external
 network interfaces or at least multiple IP addresses to work correctly.
@@ -529,6 +562,8 @@ Those are:
 
 ### Accumulators
 
+**PostgreSQL**
+
 The PostgreSQL configuration uses two accumulators that record `database user`
 pairs (separated by a single space) for the `pg_hba.conf` file. These
 accumulators are called:
@@ -552,12 +587,66 @@ to the node.
 Example:
 
 ```yaml
-file.accumulated:
-    - name: postgresql-hba-md5users-accumulator
-    - filename: {{pillar['postgresql']['hbafile']}}
-    - text: {{pillar['vault']['postgres']['dbname']}} {{pillar['vault']['postgres']['dbuser']}}
-    - require_in:
-        - file: postgresql-hba-config
+mydb-remote-user:
+    file.accumulated:
+        - name: postgresql-hba-md5users-accumulator
+        - filename: {{pillar['postgresql']['hbafile']}}
+        - text: {{pillar['vault']['postgres']['dbname']}} {{pillar['vault']['postgres']['dbuser']}}
+        - require_in:
+            - file: postgresql-hba-config
+```
+
+**Apache2**
+
+The Apache2 configuration uses an acuumulator `apache2-listen-ports` to gather
+all listen directives for its `/etc/apache2/ports.conf` file. The filename
+attribute  for states setting up new `Listen` directives, should be set to 
+`apache2-ports-config`. The values accumulated can be either just port numbers
+or `ip:port` pairs.
+
+Example:
+
+```yaml
+apache2-webdav-port:
+    file.accumulated:
+        - name: apache2-listen-ports
+        - filename: /etc/apache2/ports.conf
+        - text: {{my_ip}}:{{my_port}}
+        - require_in:
+            - file: apache2-ports-config
+```
+
+## PowerDNS Recursor
+
+This Salt config sets up a PowerDNS recursor on every node that serves as an
+interface to the Consul DNS API. It's usually only available to local clients
+on `127.0.0.1:53` and `169.254.1.1:53` from where it forwards to Consul on 
+`169.254.1.1:8600`. However, sometimes it's useful to expose the DNS API to
+other services, for example on a Docker bridge or for other OCI containers.
+
+### Accumulators
+
+The PowerDNS configuration uses two accumulators to allow the adding of IPs
+that PowerDNS Recursor listens on and allow CIDR ranges that can query the 
+recursing DNS server on those IPs:
+
+  * `powerdns-recursor-additional-listen-ips` and
+  * `powerdns-recursor-additional-cidrs`
+  
+As above, the `filename` attribute for each `file.accumulated` state that uses
+one such accumulator *must* be set to `/etc/powerdns/recursor.conf` and it must
+have a `require_in` directive tying it to the `pdns-recursor-config` state.
+
+Example:
+
+```yaml
+mynetwork-dns:
+    file.accumulated:
+          - name: powerdns-recursor-additional-listen-ips
+          - filename: /etc/powerdns/recursor.conf
+          - text: 10.0.254.1
+          - require_in:
+              - file: pdns-recursor-config
 ```
 
 

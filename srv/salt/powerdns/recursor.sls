@@ -1,4 +1,9 @@
 
+include:
+    - powerdns.sync
+    - consul.sync
+
+
 pdns-recursor:
     pkg.installed
 
@@ -12,11 +17,16 @@ pdns-recursor-config:
         - mode: '0644'
         - template: jinja
         - context:
-            cidr: {{pillar.get('powerdns', {}).get('bind-ip',
+            cidrs:
+                - {{pillar.get('powerdns', {}).get('bind-ip',
                       grains['ip_interfaces'][pillar['ifassign']['internal']][pillar['ifassign'].get(
                           'internal-ip-index', 0
                       )|int()]
                   )}}/{{pillar.get('powerdns', {}).get('bitmask', 32)}}
+            {% if pillar.get('ci', False) %}
+                - {{pillar.get('ci', {}).get('garden-network-pool',
+                      '10.254.0.0/22')}}
+            {% endif %}
 
 
 pdns-recursor-lua-config:
@@ -33,16 +43,25 @@ pnds-recursor-override-resolv.conf:
     file.managed:
         - name: /etc/resolv.conf
         - contents: |
-            nameserver 127.0.0.1
+            nameserver 169.254.1.1
         - mode: '0644'
         - user: root
         - group: root
-    cmd.run:
-        - name: chattr +i /etc/resolv.conf
-        - onchanges:
-            - file: pnds-recursor-override-resolv.conf
         - require:
-            - file: pnds-recursor-override-resolv.conf
+            - service: pdns-recursor-service
+        - require_in:
+            - cmd: powerdns-sync
+
+
+pdns-dhclient-enforce-nameservers:
+    file.append:
+        - name: /etc/dhcp/dhclient.conf
+        - text: |
+            supersede domain-name-servers 169.254.1.1;
+        - require:
+            - service: pdns-recursor-service
+        - require_in:
+            - cmd: powerdns-sync
 
 
 pdns-recursor-service:
@@ -50,10 +69,13 @@ pdns-recursor-service:
         - name: pdns-recursor
         - sig: /usr/sbin/pdns_recursor
         - enable: True
-        - order: 10  # see ORDER.md
+        - init_delay: 3
+        #- order: 10  # see ORDER.md
         - watch:
-            - file: pnds-recursor-override-resolv.conf
             - file: pdns-recursor-config
             - file: pdns-recursor-lua-config
         - require:
             - pkg: pdns-recursor
+            - cmd: consul-sync
+        - require_in:
+            - cmd: powerdns-sync

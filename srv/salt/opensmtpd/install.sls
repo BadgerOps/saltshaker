@@ -95,12 +95,6 @@ amavisd:
             - file: /etc/amavis/conf.d*
 
 
-dkimproxy:
-    pkg.installed:
-        - name: dkimproxy
-        - install_recommends: False
-
-
 {% if pillar['smtp']['receiver']['sslcert'] != 'default' %}
 opensmtpd-receiver-sslcert:
     file.managed:
@@ -259,6 +253,19 @@ opensmtpd-service:
             - email-storage
         - watch:
             - file: opensmtpd-config
+            {% if pillar['smtp']['receiver']['sslcert'] != 'default' %}
+            - file: opensmtpd-receiver-sslcert
+            - file: opensmtpd-receiver-sslkey
+            {% endif %}
+            {% if pillar['smtp']['relay']['sslcert'] != 'default' %}
+            - file: opensmtpd-relay-sslcert
+            - file: opensmtpd-relay-sslkey
+            {% endif %}
+            {% if pillar['smtp']['relay']['sslcert'] == 'default' or
+                pillar['smtp']['receiver']['sslcert'] == 'default' %}
+            - file: ssl-maincert-combined-certificate
+            - file: ssl-maincert-key
+            {% endif %}
 
 
 opensmtpd-authserver-config:
@@ -275,15 +282,6 @@ opensmtpd-authserver-config:
             # this is difficult to dedupe since pillars can't easily reference other pillars
             dbuser: opensmtpd-authserver
             dbpass: {{pillar['dynamicsecrets']['opensmtpd-authserver']}}
-        - require:
-            - pkg: opensmtpd
-
-
-procmail:
-    pkg.installed:
-        - install_recommends: False
-        # this would be a gratuitous requirement if procmail didn't pull in mail-transport-agent
-        # which means exim is installed if opensmtpd fails to install
         - require:
             - pkg: opensmtpd
 
@@ -346,6 +344,22 @@ opensmtpd-{{svc}}-tcp-in25-recv:
 {% endfor %}
 
 
+opensmtpd-relay-tcp-in465-recv:
+    iptables.append:
+        - table: filter
+        - chain: INPUT
+        - jump: ACCEPT
+        - source: '0/0'
+        - destination: {{opensmtpd_ips['relay']}}/32
+        - dport: 465
+        - match: state
+        - connstate: NEW
+        - proto: tcp
+        - save: True
+        - require:
+            - sls: iptables
+
+
 opensmtpd-receiver-tcp-in465-recv:
     iptables.append:
         - table: filter
@@ -353,6 +367,37 @@ opensmtpd-receiver-tcp-in465-recv:
         - jump: ACCEPT
         - source: '0/0'
         - destination: {{opensmtpd_ips['receiver']}}/32
+        - dport: 465
+        - match: state
+        - connstate: NEW
+        - proto: tcp
+        - save: True
+        - require:
+            - sls: iptables
+
+
+opensmtpd-relay-out25-send:
+    iptables.append:
+        - table: filter
+        - chain: OUTPUT
+        - jump: ACCEPT
+        - source: {{salt['network.interface_ip'](salt['network.default_route']('inet')[0]['interface'])}}/32
+        - destination: 0/0
+        - dport: 25
+        - match: state
+        - connstate: NEW
+        - proto: tcp
+        - save: True
+        - require:
+            - sls: iptables
+
+opensmtpd-relay-out465-send:
+    iptables.append:
+        - table: filter
+        - chain: OUTPUT
+        - jump: ACCEPT
+        - source: {{salt['network.interface_ip'](salt['network.default_route']('inet')[0]['interface'])}}/32
+        - destination: 0/0
         - dport: 465
         - match: state
         - connstate: NEW

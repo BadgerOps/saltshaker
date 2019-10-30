@@ -1,35 +1,45 @@
 
 include:
+    - consul.sync
+    - powerdns.sync
     - dev.concourse.install
 
 
-concourse-keys-worker_key:
-    cmd.run:
-        - name: ssh-keygen -t rsa -f /etc/concourse/private/worker_key.pem -N ''
-        - runas: concourse
-        - creates:
-            - /etc/concourse/private/worker_key.pem
-            - /etc/concourse/private/worker_key.pem.pub
-        - require:
-            - file: concourse-private-config-folder
-            - user: concourse-user
+concourse-keys-worker_key-public:
     file.managed:
-        - name: /etc/concourse/private/worker_key.pem
+        - name: /etc/concourse/private/worker_key.pem.pub
+        - contents_pillar: dynamicsecrets:concourse-workerkey:public
         - user: concourse
         - group: concourse
-        - mode: '0640'
-        - replace: False
+        - mode: '0644'
+        - replace: True
         - require:
-            - cmd: concourse-keys-worker_key
+            - user: concourse-user
+            - file: concourse-private-config-folder
+
+
+concourse-keys-worker_key:
+    file.managed:
+        - name: /etc/concourse/private/worker_key.pem
+        - contents_pillar: dynamicsecrets:concourse-workerkey:key
+        - user: concourse
+        - group: concourse
+        - mode: '0600'
+        - replace: True
+        - require:
+            - file: concourse-keys-worker_key-public
+            - user: concourse-user
 
 
 # register the worker for the server
 concourse-worker_key-consul-submit:
     cmd.run:
         - name: consul kv put concourse/workers/sshpub/{{grains['id']}} @/etc/concourse/private/worker_key.pem.pub
-        - unless: consul kv get -list concourse/workers/sshpub/{{grains['id']}}
+        - onchanges:
+            - file: concourse-keys-worker_key-public
         - require:
             - file: concourse-keys-worker_key
+            - cmd: consul-sync
 
 
 concourse-worker-dir:
@@ -42,8 +52,22 @@ concourse-worker-dir:
             - user: concourse-user
 
 
-concourse-worker:
+concourse-worker-envvars:
     file.managed:
+        - name: /etc/concourse/envvars-worker
+        - user: root
+        - group: root
+        - mode: '0600'
+        - contents: |
+            CONCOURSE_GARDEN_NETWORK_POOL="{{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}"
+            CONCOURSE_GARDEN_DOCKER_REGISTRY="{{pillar.get('ci', {}).get('garden-docker-registry',
+              'registry-1.docker.io')}}"
+            CONCOURSE_GARDEN_DNS_SERVER=169.254.1.1
+            CONCOURSE_GARDEN_DESTROY_CONTAINERS_ON_STARTUP=1
+
+
+concourse-worker:
+    systemdunit.managed:
         - name: /etc/systemd/system/concourse-worker.service
         - source: salt://dev/concourse/concourse.jinja.service
         - template: jinja
@@ -56,27 +80,31 @@ concourse-worker:
             # tsa-host on 127.0.0.1 works because there is haproxy@internal proxying it
             arguments: >
                 --work-dir /srv/concourse-worker
-                --tsa-host 127.0.0.1
+                --bind-ip 127.0.0.1
+                --bind-port 7777
+                --tsa-host 127.0.0.1:{{pillar.get('concourse-server', {}).get('tsa-port', 2222)}}
                 --tsa-public-key /etc/concourse/host_key.pub
                 --tsa-worker-private-key /etc/concourse/private/worker_key.pem
-                --garden-network-pool {{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}
-                --garden-docker-registry {{pillar.get('ci', {}).get('garden-docker-registry', 'registry-1.docker.io')}}
+            environment_files:
+                - /etc/concourse/envvars-worker
         - require:
             - file: concourse-install
             - file: concourse-worker-dir
+            - cmd: concourse-worker_key-consul-submit
     service.running:
         - name: concourse-worker
-        - sig: /usr/local/bin/concourse worker
+        - sig: /usr/local/bin/concourse_linux_amd64 worker
         - enable: True
         - require:
-            - file: concourse-worker
+            - cmd: powerdns-sync
         - watch:
-            - file: concourse-worker
+            - systemdunit: concourse-worker
             - file: concourse-install  # restart on a change of the binary
+            - file: concourse-worker-envvars
 
 
 # allow forwarding of outgoing dns/http/https traffic to the internet from concourse.ci/garden containers
-{% for port in ['53', '80', '443'] %}
+{% for port in ['53', '80', '443', '8100'] %}
 concourse-worker-tcp-out{{port}}-forward:
     iptables.append:
         - table: filter
@@ -84,6 +112,26 @@ concourse-worker-tcp-out{{port}}-forward:
         - jump: ACCEPT
         - source: {{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}
         - destination: 0/0
+        - dport: {{port}}
+        - match: state
+        - connstate: NEW
+        - proto: tcp
+        - save: True
+        - require:
+            - sls: iptables
+{% endfor %}
+
+
+# allow incoming connections from concourse TSA. Outgoing connections for the web/server node are
+# covered by basics.sls for the internal network
+{% for port in ['7777', '7788', '7799'] %}
+concourse-worker-tcp-in{{port}}-recv:
+    iptables.append:
+        - table: filter
+        - chain: INPUT
+        - jump: ACCEPT
+        - in-interface: {{pillar['ifassign']['internal']}}
+        - dport: {{port}}
         - match: state
         - connstate: NEW
         - proto: tcp
@@ -100,6 +148,7 @@ concourse-worker-udp-out53-forward:
         - jump: ACCEPT
         - source: {{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}
         - destination: 0/0
+        - dport: 53
         - match: state
         - connstate: NEW
         - proto: udp
@@ -107,5 +156,28 @@ concourse-worker-udp-out53-forward:
         - require:
             - sls: iptables
 
+
+concourse-allow-inter-container-traffic-recv:
+    iptables.append:
+        - table: filter
+        - chain: INPUT
+        - jump: ACCEPT
+        - source: {{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}
+        - destination: {{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}
+        - save: True
+        - require:
+            - sls: iptables
+
+
+concourse-allow-inter-container-traffic-send:
+    iptables.append:
+        - table: filter
+        - chain: OUTPUT
+        - jump: ACCEPT
+        - source: {{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}
+        - destination: {{pillar.get('ci', {}).get('garden-network-pool', '10.254.0.0/22')}}
+        - save: True
+        - require:
+            - sls: iptables
 
 # vim: syntax=yaml

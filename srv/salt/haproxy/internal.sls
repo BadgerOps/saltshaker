@@ -5,6 +5,7 @@
 
 include:
     - haproxy.install
+    - haproxy.sync
 
 
 haproxy-config-template-internal:
@@ -13,8 +14,8 @@ haproxy-config-template-internal:
         - source: salt://haproxy/haproxy-internal.jinja.cfg
         - require:
             - pkg: haproxy
-        - watch_in:
-            - service: consul-template-service
+        - onchanges_in:
+            - cmd: consul-template-servicerenderer
 
 
 smartstack-internal:
@@ -39,12 +40,15 @@ smartstack-internal:
                 {%- endif %}
             template: /etc/haproxy/haproxy-internal.jinja.cfg
         - require:
+            - systemdunit: haproxy-multi
             - file: haproxy-config-template-internal
+            - file: consul-template-dir
     service.enabled:  # haproxy will be started by the smartstack script rendered by consul-template (see command above)
         - name: haproxy@internal
         - require:
-            - file: haproxy-multi
             - file: smartstack-internal
+        - require_in:
+            - cmd: smartstack-internal-sync
 
 
 # vim: syntax=yaml

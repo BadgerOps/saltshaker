@@ -12,10 +12,38 @@
 # assign it to a node directly.
 #
 
+include:
+    - consul.sync
+
+
 {% set consul_user = "consul" %}
 {% set consul_group = "consul" %}
 
+# We need to make Consul local APIs (DNS and HTTP) available on a routable link-local IP address so
+# we can easily use them from separate network spaces like the Docker bridge network.
+consul-network-interface:
+    file.managed:
+        - name: /etc/network/interfaces.d/consul0
+        - source: salt://consul/consul0.interface
+    cmd.run:
+        - name: ifdown consul0; ifup consul0
+        - onchanges:
+            - file: consul-network-interface
+
+
 consul-data-dir:
+    file.directory:
+        - name: /var/lib/consul
+        - makedirs: True
+        - user: {{consul_user}}
+        - group: {{consul_group}}
+        - mode: '0700'
+        - require:
+            - user: consul
+            - group: consul
+
+
+consul-run-dir:
     file.directory:
         - name: /run/consul
         - makedirs: True
@@ -99,10 +127,15 @@ consul-common-config:
                             )|int()]
                         )
                       }}
+            consul_interface_ip: 169.254.1.1
             datacenter: {{pillar['consul-cluster']['datacenter']}}
             encryption_key: {{pillar['dynamicsecrets']['consul-encryptionkey']}}
         - require:
             - file: consul-basedir
+            - user: consul
+            - group: consul
+            - file: consul-service-dir
+            - file: consul-conf-dir
 
 
 consul:
@@ -121,6 +154,7 @@ consul:
         - source: {{pillar["urls"]["consul"]}}
         - source_hash: {{pillar["hashes"]["consul"]}}
         - archive_format: zip
+        - unless: test -f /usr/local/bin/consul  # workaround for https://github.com/saltstack/salt/issues/42681
         - if_missing: /usr/local/bin/consul
         - enforce_toplevel: False
     file.managed:
@@ -132,6 +166,7 @@ consul:
         - require:
             - user: consul
             - file: consul-data-dir
+            - file: consul-run-dir
             - archive: consul
 
 
@@ -144,8 +179,24 @@ consul-rsyslog:
         - mode: '0644'
 
 
+# open consul interface
+consul-all-in-recv:
+    iptables.insert:
+        - position: 2
+        - table: filter
+        - chain: INPUT
+        - jump: ACCEPT
+        - destination: 169.254.1.1
+        - save: True
+        - require:
+            - sls: iptables
+            - cmd: consul-network-interface
+        - require_in:
+            - cmd: consul-sync-network
+
+
 # open consul ports TCP
-{% for port in ['8300', '8301', '8400', '8500', '8600'] %}
+{% for port in ['8300', '8301', '8302', '8400', '8500', '8600'] %}
 # allow others to talk to us
 consul-tcp-in{{port}}-recv:
     iptables.append:
@@ -154,33 +205,19 @@ consul-tcp-in{{port}}-recv:
         - jump: ACCEPT
         - in-interface: {{pillar['ifassign']['internal']}}
         - dport: {{port}}
+        - proto: tcp
         - match: state
         - connstate: NEW
-        - proto: tcp
         - save: True
         - require:
             - sls: iptables
-
-
-# allow us to talk to others
-consul-tcp-out{{port}}-send:
-    iptables.append:
-        - table: filter
-        - chain: OUTPUT
-        - jump: ACCEPT
-        - out-interface: {{pillar['ifassign']['internal']}}
-        - dport: {{port}}
-        - match: state
-        - connstate: NEW
-        - proto: tcp
-        - save: True
-        - require:
-            - sls: iptables
+        - require_in:
+            - cmd: consul-sync-network
 {% endfor %}
 
 
 # open consul ports UDP
-{% for port in ['8301', '8600'] %}
+{% for port in ['8301', '8302', '8600'] %}
 consul-udp-in{{port}}-recv:
     iptables.append:
         - table: filter
@@ -192,19 +229,8 @@ consul-udp-in{{port}}-recv:
         - save: True
         - require:
             - sls: iptables
-
-
-consul-udp-in{{port}}-send:
-    iptables.append:
-        - table: filter
-        - chain: OUTPUT
-        - jump: ACCEPT
-        - out-interface: {{pillar['ifassign']['internal']}}
-        - sport: {{port}}
-        - proto: udp
-        - save: True
-        - require:
-            - sls: iptables
+        - require_in:
+            - cmd: consul-sync-network
 {% endfor %}
 
 

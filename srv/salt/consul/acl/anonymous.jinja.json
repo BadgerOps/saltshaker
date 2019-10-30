@@ -1,24 +1,25 @@
 {
-    "ID": "anonymous",
-    "Type": "client",
+    "Name": "anonymous",
+    "Description": "The anonymous policy",
     "Rules": "{{"
-key \"\" {
+key_prefix \"\" {
     policy = \"deny\"
 }
 
-key \"oauth2-clients\" {
-    policy = \"write\"
-}
-
-key \"concourse/workers/sshpub\" {
-    policy = \"write\"
-}
-node \"\" {
+key_prefix \"oauth2-clients\" {
     policy = \"read\"
 }
 
-service \"\" {
-    policy = \"write\"
+key_prefix \"concourse/workers/sshpub\" {
+    policy = \"read\"
+}
+
+node_prefix \"\" {
+    policy = \"read\"
+}
+
+service_prefix \"\" {
+    policy = \"read\"
 }
 
 /* we configure a master token for this stuff */

@@ -11,10 +11,17 @@ base:
         - consul.template  # everything needs consul-template in smartstack
         - haproxy.internal  # everything needs local proxies in smartstack
         - powerdns.recursor
+        - duplicity
+        - vault.install
+        - mn.cas.client
 
-    # leading "not" is not supported http://docs.saltstack.com/en/latest/topics/targeting/compound.html
+    'roles:xenserver':
+        - match: grain
+        - xen
+        - consul.server
+
     # everything that is not a consul server has a consul agent
-    '* and not G@roles:consulserver':
+    'not G@roles:consulserver and not G@roles:xenserver':
         - match: compound
         - consul.agent
 
@@ -31,37 +38,52 @@ base:
         - match: grain
         - vault
         - mn.cas.vault_database
+        - dev.concourse.vault_credentials
+
+    'roles:docker-registry':
+        - match: grain
+        - docker.registry
 
     'roles:dev':
         - match: grain
         - dev.pbuilder
-        - dev.aptly
+        - dev.aptly.install
+        - dev.aptly.apiserver
         - dev.fpm
 #        - dev.pypi
 #        - sentry
         - compilers
         - python.dev
-        - docker
+        - docker.install
 
     'roles:buildserver':
         - match: grain
+        - vault.install
         - dev.concourse.server
 
     'roles:buildworker':
         - match: grain
         - dev.concourse.worker
+        - vault.install
+        - nomad.client
 
     'roles:apps':
         - match: grain
-        - docker
+        - docker.install
         - nomad.install
         - mn.appconfig
+
+    'roles:photosync':
+        - match: grain
+        - mn.photosync
+        - fstab.secure
 
     'roles:database':
         - match: grain
         - fstab.secure
         - fstab.data
         - postgresql.fast
+        - postgresql.checkuser
         - redis.cache
         - dev.concourse.postgres_database
         - postgresql.secure
@@ -70,15 +92,21 @@ base:
         - mn.cas.postgres_database # this state is empty if authserver doesn't use a database backend
         - mn.cas.postgres_spapi_access # ^ ditto
 
+    # every node that's not a mailserver routes through a mailserver via smartstack
+    'not G@roles:mail':
+        - match: compound
+        - ssmtp
+
     'roles:mail':
         - match: grain
         - fstab.secure
         - dovecot
         - opensmtpd.install
-        - mail.nixspam
         - mail.spamassassin
         - mail.storage
         - mn.cas.dkimsigner
+        - mn.cas.mailforwarder
+        - ssmtp.not
 
     'roles:pim':
         - match: grain
@@ -89,10 +117,25 @@ base:
         - match: grain
         - mn.cas.server
         - mn.appconfig
+        - docker.authserver_dockerregistry  # empty unless a JWT key is configured
+        - apache.webdav_permissions_py
+        - dev.concourse.authserver_oauth2
 
     'roles:loadbalancer':
         - match: grain
         - haproxy.external
+
+    'roles:vpngateway':
+        - match: grain
+        - openvpn.gateway
+
+    'not G@roles:vpngateway':
+        - match: compound
+        - openvpn.gateway_accessible
+
+    'roles:webdav':
+        - match: grain
+        - apache.webdav
 
     '*.test':
         # put vagrant user config on .test machines
@@ -100,7 +143,7 @@ base:
         # enable the NAT networking device for all network traffic
         - iptables.vagrant
 
-# put my personal user on every other machine
+    # put my personal user on every other machine
     '(?!saltmaster).*?net(|.internal)$':
         - match: pcre
         - mn.users.jonas

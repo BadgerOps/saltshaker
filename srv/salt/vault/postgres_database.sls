@@ -7,7 +7,14 @@
 # directly, side-stepping smartstack.
 #
 
-{% if pillar['vault'].get('backend', '') == 'postgresql' %}
+{% if pillar['vault'].get('backend', '') == 'postgresql' and
+      pillar['vault'].get('create-database', False) %}
+
+include:
+    - postgresql.sync
+    - consul.sync
+    - powerdns.sync
+
 
 # only create this if the PostgreSQL backend is selected
 vault-postgres:
@@ -15,7 +22,6 @@ vault-postgres:
         - name: {{pillar['vault']['postgres']['dbuser']}}
         - createdb: False
         - createroles: False
-        - createuser: False
         - encrypted: True
         - login: True
         - inherit: False
@@ -25,7 +31,7 @@ vault-postgres:
         - user: postgres
         - order: 20  # see ORDER.md
         - require:
-            - secure-tablespace
+            - cmd: postgresql-sync
     file.accumulated:
         - name: postgresql-hba-md5users-accumulator
         - filename: {{pillar['postgresql']['hbafile']}}
@@ -41,7 +47,6 @@ vault-postgres:
         - order: 20  # see ORDER.md
         - require:
             - postgres_user: vault-postgres
-            - secure-tablespace
     cmd.script:
         - name: salt://vault/vault_postgresql_db.jinja.sh
         - template: jinja
@@ -58,4 +63,21 @@ vault-postgres:
             - PGPASSWORD: {{pillar['dynamicsecrets']['secure-vault']}}
         - require:
             - postgres_database: vault-postgres
+        - require_in:
+            - cmd: vault-sync-database
+
+
+vault-postgres-ready:
+    cmd.run:
+        - name: >
+            until host postgresql.service.consul || test ${count} -gt 30; do sleep 1; count=$((count+1)); done &&
+            test ${count} -lt 30
+        - env:
+            count: 0
+        - require_in:
+            - cmd: vault-sync-database
+        - require:
+            - cmd: vault-postgres
+            - cmd: consul-sync
+            - cmd: powerdns-sync
 {% endif %}

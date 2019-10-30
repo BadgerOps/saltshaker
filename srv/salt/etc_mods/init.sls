@@ -13,14 +13,15 @@ inputrc:
 # Some services must have a hostname for SSL to work, so these aliases can just be added
 # to every /etc/hosts
 {% set local_aliases = [
-    pillar['vault']['smartstack-hostname'],
-    pillar['postgresql']['smartstack-hostname'],
-    pillar['smtp']['smartstack-hostname'],
+    pillar.get('vault', {}).get('smartstack-hostname', None),
+    pillar.get('postgresql', {}).get('smartstack-hostname', None),
+    pillar.get('smtp', {}).get('smartstack-hostname', None),
+    pillar.get('authserver', {}).get('smartstack-hostname', None),
 ]%}
 smartstack-hostnames:
     file.append:
         - name: /etc/hosts
-        - text: 127.0.0.1    {% for alias in local_aliases %}{{alias}} {% endfor %}
+        - text: 127.0.0.1    {% for alias in local_aliases %}{% if alias %}{{alias}} {% endif %}{% endfor %}
         - order: 2
 
 
@@ -52,6 +53,8 @@ vault-envvar-config:
 
 
 sudoers-config:
+    pkg.installed:
+        - name: sudo
     file.managed:
         - name: /etc/sudoers.d/salt-sudoers
         - source: salt://etc_mods/salt-sudoers.jinja
@@ -61,3 +64,12 @@ sudoers-config:
         - user: root
         - group: root
         - mode: '0440'
+        - require:
+            - pkg: sudoers-config
+
+
+ensure-interfaces.d-works:
+    file.append:
+        - name: /etc/network/interfaces
+        - text: source /etc/network/interfaces.d/*
+        - order: 2

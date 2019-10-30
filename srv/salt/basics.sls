@@ -53,7 +53,30 @@ basic-required-packages:
             - net-tools
             - libcap2-bin
             - apt-transport-https
+            - apt-transport-s3
+            - cron
+            - dbus
+            - jq
+            - curl
         -  order: 1  # execute this state early, because later states need unzip
+
+
+empty-crontab:
+    file.managed:
+        - name: /etc/cron.d/00-ignore
+        - contents: |
+            # nothing to see here, this is just for salt
+
+
+cron:
+    service.running:
+        - sig: /usr/sbin/cron
+        - watch:
+            - file: /etc/cron.d*
+
+
+dbus:
+    service.running
 
 
 stretch:
@@ -65,6 +88,14 @@ stretch:
         {% endif %}
         - consolidate: True
         - order: 1  # execute this state early!
+
+
+saltstack-repo:
+    pkgrepo.managed:
+        - name: {{pillar['repos']['saltstack']}}
+        - file: /etc/apt/sources.list.d/saltstack.list
+        - key_url: salt://saltstack_0E08A149DE57BFBE.pgp.key
+        - order: 2  # execute this state early!
 
 
 updates-stretch:
@@ -81,32 +112,49 @@ security-updates-stretch:
         - order: 2  # execute this state early!
 
 
-#backports-org-stretch:
-#    pkgrepo.managed:
-#        - name: {{pillar['repos']['stretch-backports']}}
-#        - file: /etc/apt/sources.list.d/stretch-backports.list
-#        - order: 2  # execute this state early!
-#    file.managed:
-#        - name: /etc/apt/preferences.d/stretch-backports
-#        - source: salt://etc_mods/stretch-backports
+backports-org-stretch:
+    pkgrepo.managed:
+        - name: {{pillar['repos']['stretch-backports']}}
+        - file: /etc/apt/sources.list.d/stretch-backports.list
+        - order: 2  # execute this state early!
+    file.managed:
+        - name: /etc/apt/preferences.d/stretch-backports
+        - source: salt://etc_mods/stretch-backports
 
 
 maurusnet-opensmtpd:
     pkgrepo.managed:
         - humanname: repo.maurus.net-opensmtpd
         - name: {{pillar['repos']['maurusnet-opensmtpd']}}
-        - file: /etc/apt/sources.list.d/opensmtpd.list
+        - file: /etc/apt/sources.list.d/mn-opensmtpd.list
         - key_url: salt://mn/packaging_authority_A78049AF.pgp.key
         - order: 2
 
 
-maurusnet-authserver:
+maurusnet-apps:
     pkgrepo.managed:
-        - humanname: repo.maurus.net-nightly
-        - name: {{pillar['repos']['maurusnet-nightly']}}
-        - file: /etc/apt/sources.list.d/mn-nightly.list
+        - humanname: repo.maurus.net-apps
+        - name: {{pillar['repos']['maurusnet-apps']}}
+        - file: /etc/apt/sources.list.d/mn-apps.list
         - key_url: salt://mn/packaging_authority_A78049AF.pgp.key
         - order: 2
+
+
+# enforce UTC
+timezone-utc:
+    cmd.run:
+        - name: timedatectl set-timezone UTC
+        - unless: test "$(readlink /etc/localtime)" = "../usr/share/zoneinfo/UTC"
+        - require:
+            - service: dbus
+
+
+# Provide the salt-master with an event so it knows that the highstate is done.
+# We use this, for example, to sync saltmine data.
+trigger-minion-sync:
+    event.send:
+        - name: maurusnet/highstate/complete
+        - order: last
 
 
 #openssl:
@@ -147,8 +195,8 @@ openssh-in22-recv:
 # Note: Consul is installed on all machines so it's covered by consul.install
 {%- set tcp = ['22', '53', '80', '123', '443', '11371'] %}
 
-# dns out, ntp out
-{%- set udp = ['53', '123'] %}
+# dns out, dhcp out, ntp out
+{%- set udp = ['53', '67', '123'] %}
 
 {% for port in tcp %}
 # allow us to contact others on ports
@@ -168,18 +216,6 @@ basics-tcp-out{{port}}-send:
 
 
 {% for port in udp %}
-# allow us to call others
-basics-udp-out{{port}}-send:
-    iptables.append:
-        - table: filter
-        - chain: OUTPUT
-        - jump: ACCEPT
-        - proto: udp
-        - dport: {{port}}
-        - save: True
-        - order: 2
-
-
 # allow others to answer. For UDP we make this stateless here to guarantee it works.
 basics-udp-out{{port}}-recv:
     iptables.append:
@@ -188,6 +224,18 @@ basics-udp-out{{port}}-recv:
         - jump: ACCEPT
         - proto: udp
         - sport: {{port}}
+        - save: True
+        - order: 2
+
+
+# allow us to talk to others. For UDP we make this stateless here to guarantee it works.
+basics-udp-out{{port}}-send:
+    iptables.append:
+        - table: filter
+        - chain: OUTPUT
+        - jump: ACCEPT
+        - proto: udp
+        - dport: {{port}}
         - save: True
         - order: 2
 {% endfor %}
@@ -204,6 +252,7 @@ basics-internal-network-tcp:
         - connstate: NEW
         - proto: tcp
         - save: True
+        - order: 2
         - require:
             - sls: iptables
 
@@ -216,6 +265,7 @@ basics-internal-network-udp:
         - out-interface: {{pillar['ifassign']['internal']}}
         - proto: udp
         - save: True
+        - order: 2
         - require:
             - sls: iptables
 
